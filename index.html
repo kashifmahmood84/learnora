@@ -10,6 +10,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=Fredoka+One&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- SheetJS kept for legacy Excel fallback only -->
 <style>
 /* ============================================================
    LEARNORA v4 — DESIGN SYSTEM
@@ -2264,7 +2265,7 @@ a{color:inherit;text-decoration:none;}
   <canvas id="confetti-canvas"></canvas>
 
   <!-- Hidden file input — single global instance used by all upload triggers -->
-  <input type="file" id="file-input-global" accept=".xlsx,.xls,.csv" multiple style="display:none;">
+  <input type="file" id="file-input-global" accept=".json,.xlsx,.xls" multiple style="display:none;">
 
   <!-- CONFIRM MODAL -->
   <div class="overlay" id="confirm-modal" style="z-index:600;">
@@ -3228,7 +3229,7 @@ function renderSubjectsManage(wrap){
   // Action strip
   html += `<div style="display:flex;gap:8px;margin-bottom:20px;">
     <button class="btn btn-vi" style="flex:1;border-radius:var(--r3);" onclick="showAddSubjectModal()">+ Add Subject</button>
-    <button class="btn" style="flex:1;border-radius:var(--r3);background:var(--bg3);border:1px solid var(--rim);color:var(--fog3);" onclick="triggerUpload()">📤 Upload Excel</button>
+    <button class="btn" style="flex:1;border-radius:var(--r3);background:var(--bg3);border:1px solid var(--rim);color:var(--fog3);" onclick="triggerUpload()">📤 Upload JSON</button>
   </div>`;
 
   // Upload status (moved here)
@@ -4953,7 +4954,7 @@ function triggerUploadForSubject(subjName){
 function handleDropForSubject(e, subjName){
   e.preventDefault();
   document.querySelectorAll('.upload-zone').forEach(z=>z.classList.remove('drag'));
-  const files=[...e.dataTransfer.files].filter(f=>f.name.match(/\.(xlsx|xls|csv)$/i));
+  const files=[...e.dataTransfer.files].filter(f=>f.name.match(/\.(json|xlsx|xls)$/i));
   if(!files.length){ showToast('Drop an Excel or CSV file'); return; }
   _uploadTargetSubject = subjName;
   processFilesSequential(files);
@@ -4979,153 +4980,184 @@ async function processFilesSequential(files){
   setTimeout(hideUploadStatus, 4000);
 }
 
-/* ── Core file processor (v3-quality with full validation, warnings, error records) ── */
+/* ── Core file processor — JSON primary, Excel fallback ── */
 async function processOneFile(file, forceSubject=null){
   showUploadStatus('Reading '+file.name+'…');
-
-  if(!file.name.match(/\.(xlsx|xls|csv)$/i)){
-    showUploadStatus('Unsupported file type. Use .xlsx, .xls or .csv', 'err');
+  if(!file.name.match(/\.(json|xlsx|xls)$/i)){
+    showUploadStatus('Unsupported file type. Use .json (recommended) or .xlsx','err');
     showToast('Unsupported: '+file.name); return;
   }
   if(file.size > 10*1024*1024){
-    showUploadStatus('File too large (max 10 MB)', 'err');
+    showUploadStatus('File too large (max 10 MB)','err');
     showToast('File too large'); return;
   }
-
-  const fileId = 'f_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
-
+  const fileId='f_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
   try {
-    const buf = await file.arrayBuffer();
-    let wb;
-    try { wb = XLSX.read(buf,{type:'array'}); }
-    catch(e){ throw new Error('Cannot read file — is it a valid Excel/CSV? ('+e.message+')'); }
-
-    if(!wb.SheetNames.length) throw new Error('File has no sheets');
-
-    /* ── Content Pack ── */
-    const ciSheet  = wb.Sheets['Course Info']||wb.Sheets['course_info']||null;
-    const lesSheet = wb.Sheets['Lessons']||wb.Sheets['lessons']
-      || wb.Sheets[wb.SheetNames.find(n=>!/questions|flashcards|examples|course.?info/i.test(n))]
-      || wb.Sheets[wb.SheetNames[0]];
-    const qSheet   = wb.Sheets['Questions']||wb.Sheets['questions']||null;
-    const fcSheet  = wb.Sheets['Flashcards']||wb.Sheets['flashcards']||null;
-    const exSheet  = wb.Sheets['Examples']||wb.Sheets['examples']||null;
-
-    if(!lesSheet) throw new Error('Could not find a "Lessons" sheet');
-
-    const lesRows = XLSX.utils.sheet_to_json(lesSheet,{defval:''});
-    const qRows   = qSheet  ? XLSX.utils.sheet_to_json(qSheet, {defval:''}) : [];
-    const fcRows  = fcSheet ? XLSX.utils.sheet_to_json(fcSheet,{defval:''}) : [];
-    const exRows  = exSheet ? XLSX.utils.sheet_to_json(exSheet,{defval:''}) : [];
-
-    const validLes = lesRows.filter(r=>r.lesson_id&&String(r.lesson_id).trim()!=='');
-    if(!validLes.length) throw new Error('No rows with a "lesson_id" in the Lessons sheet. Check column is exactly "lesson_id".');
-
-    // Course Info sheet
-    let courseInfo = {};
-    if(ciSheet){
-      const ciRows = XLSX.utils.sheet_to_json(ciSheet,{header:['field','value'],defval:''});
-      ciRows.forEach(r=>{ if(r.field) courseInfo[String(r.field).toLowerCase().replace(/[\s\-]+/g,'_')]=String(r.value||'').trim(); });
-    }
-
-    // Subject: forceSubject > Course Info > auto-detect from lesson_id prefix
-    let subject = forceSubject || String(courseInfo.subject||'').trim();
-    if(!subject){
-      const firstId = String(validLes[0].lesson_id||'').toLowerCase();
-      const pfxMap = {maths:'Mathematics',math:'Mathematics',eng:'English',sci:'Science',urdu:'Urdu',phy:'Physics',chem:'Chemistry',bio:'Biology',hist:'History',geo:'Geography'};
-      const matched = Object.keys(pfxMap).find(k=>firstId.startsWith(k+'-')||firstId.startsWith(k+'_')||firstId===k);
-      subject = matched ? pfxMap[matched] : 'General';
-    }
-
-    let topic = String(courseInfo.course_title||'').trim();
-    if(!topic) topic = file.name.replace(/\.(xlsx|xls|csv)$/i,'').replace(/[-_]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).trim();
-
-    showUploadStatus('Parsing '+validLes.length+' lessons…');
-
-    const newLessons = validLes.map((r,i)=>{
-      const uid = fileId+'_'+String(r.lesson_id).replace(/\s+/g,'_');
-      const funFacts = String(r.fun_facts||r.fun_fact||'').split('|').map(s=>s.trim()).filter(Boolean);
-      const body1 = String(r.body_1||r.body||'');
-      return {
-        uid, fileId, subject, topic,
-        id: String(r.lesson_id).trim(),
-        order: parseInt(r.lesson_order)||i+1,
-        title: String(r.title||'Lesson '+(i+1)),
-        funFact: funFacts[0]||'', funFacts,
-        imageUrl: String(r.image_url||r.image_search_query||''),
-        body: body1, body1, body2: String(r.body_2||''), body3: String(r.body_3||''),
-        keyConcepts: String(r.key_concepts||'').split('|').map(s=>s.trim()).filter(Boolean),
-        exampleProblem: String(r.example_problem||''),
-        exampleSteps: String(r.example_steps||'').split('|').map(s=>s.trim()).filter(Boolean),
-        exampleAnswer: String(r.example_answer||''),
-        readTime: parseInt(r.read_time_mins)||7,
-        rtl: String(r.rtl||'').toUpperCase()==='TRUE',
-        questions:[], flashcards:[], examples:[]
-      };
-    });
-
-    // Attach questions
-    let unmatchedQ=0;
-    qRows.filter(r=>r.lesson_id).forEach(q=>{
-      const l=newLessons.find(x=>x.id===String(q.lesson_id).trim());
-      if(l) l.questions.push({q:String(q.question||''),opts:{A:String(q.option_a||''),B:String(q.option_b||''),C:String(q.option_c||''),D:String(q.option_d||'')},correct:String(q.correct||'A').toUpperCase().trim(),explanation:String(q.explanation||''),hint:String(q.hint||''),bloom:String(q.bloom||'remember'),difficulty:String(q.difficulty||'medium')});
-      else unmatchedQ++;
-    });
-
-    // Attach flashcards
-    let unmatchedFC=0;
-    fcRows.filter(r=>r.lesson_id).forEach(f=>{
-      const l=newLessons.find(x=>x.id===String(f.lesson_id).trim());
-      if(l) l.flashcards.push({front:String(f.front||''),back:String(f.back||''),realWorld:String(f.real_world_connection||'')});
-      else unmatchedFC++;
-    });
-
-    // Attach examples
-    let unmatchedEx=0;
-    exRows.filter(r=>r.lesson_id).forEach(ex=>{
-      const l=newLessons.find(x=>x.id===String(ex.lesson_id).trim());
-      if(l) l.examples.push({order:parseInt(ex.example_order)||l.examples.length+1,problem:String(ex.problem||''),steps:String(ex.steps||'').split('|').map(s=>s.trim()).filter(Boolean),answer:String(ex.answer||'')});
-      else unmatchedEx++;
-    });
-    newLessons.forEach(l=>{ if(l.examples.length>1) l.examples.sort((a,b)=>a.order-b.order); });
-
-    const warnings=[];
-    if(unmatchedQ)  warnings.push(unmatchedQ+' question(s) had unmatched lesson_id');
-    if(unmatchedFC) warnings.push(unmatchedFC+' flashcard(s) had unmatched lesson_id');
-    if(unmatchedEx) warnings.push(unmatchedEx+' example(s) had unmatched lesson_id');
-    if(!qSheet)     warnings.push('No Questions sheet found');
-    if(!fcSheet)    warnings.push('No Flashcards sheet found');
-
-    showUploadStatus('Saving '+newLessons.length+' lessons…');
-
-    const fileRecord = {
-      id:fileId, filename:file.name, subject, topic, enabled:true,
-      uploadedAt: new Date().toISOString(),
-      lessonCount: newLessons.length,
-      questionCount: newLessons.reduce((s,l)=>s+l.questions.length,0),
-      flashcardCount: newLessons.reduce((s,l)=>s+l.flashcards.length,0),
-      exampleCount: newLessons.reduce((s,l)=>s+l.examples.length,0),
-      warnings: warnings.length ? warnings : undefined
-    };
-    await dbPut('files', fileRecord);
-    for(const l of newLessons) await dbPut('lessons', l);
-
-    showToast('✅ '+newLessons.length+' lessons added to '+subject+(warnings.length?' (⚠ '+warnings[0]+')':''));
-    showUploadStatus('✓ '+file.name+' — '+newLessons.length+' lessons'+(warnings.length?' · ⚠ '+warnings[0]:''), 'ok');
-
-    // Auto-create subject record if not already in DB
-    if(!SUBJECTS.find(s=>s.name===subject)){
-      const newSubj={id:'subj_'+Date.now()+'_'+Math.random().toString(36).slice(2,5),name:subject,icon:subjConf(subject).ic,createdAt:new Date().toISOString()};
-      await dbPut('subjects', newSubj);
-    }
-
+    if(file.name.match(/\.json$/i)) await processJSONFile(file,fileId,forceSubject);
+    else await processExcelFile(file,fileId,forceSubject);
   } catch(err){
-    console.error('[Learnora] processOneFile error:', err);
+    console.error('[Learnora] processOneFile error:',err);
     const errRecord={id:fileId,filename:file.name,subject:forceSubject||'Unknown',topic:file.name,enabled:false,uploadedAt:new Date().toISOString(),lessonCount:0,questionCount:0,flashcardCount:0,parseError:err.message};
     try{ await dbPut('files',errRecord); } catch(_){}
     showToast('Failed: '+err.message);
-    showUploadStatus('✗ '+err.message, 'err');
+    showUploadStatus('✗ '+err.message,'err');
   }
+}
+
+/* ── JSON processor ── */
+async function processJSONFile(file, fileId, forceSubject){
+  showUploadStatus('Parsing '+file.name+'…');
+  const text = await file.text();
+  let data;
+  try { data=JSON.parse(text); } catch(e){ throw new Error('Invalid JSON — '+e.message); }
+  if(!data.lessons||!Array.isArray(data.lessons)) throw new Error('JSON must have a "lessons" array');
+  if(!data.lessons.length) throw new Error('No lessons found in JSON');
+
+  const subject = forceSubject||(data.subject||'').trim()||'General';
+  const topic   = (data.topic||'').trim()||
+    file.name.replace(/\.json$/i,'').replace(/[-_]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).trim();
+
+  showUploadStatus('Building '+data.lessons.length+' lessons…');
+
+  const newLessons = data.lessons.map((l,i)=>{
+    const uid = fileId+'_'+(l.id||('lesson_'+(i+1)));
+    const sections = l.sections||[];
+    const body1=sections[0]?.content||'';
+    const body2=sections[1]?.content||'';
+    const body3=sections[2]?.content||'';
+    const questions=(l.quiz||[]).map(q=>({
+      q:q.question||'',
+      opts:q.options||{A:q.option_a||'',B:q.option_b||'',C:q.option_c||'',D:q.option_d||''},
+      correct:(q.answer||q.correct||'A').toUpperCase().trim(),
+      explanation:q.explanation||'',hint:q.hint||'',
+      bloom:q.bloom||'remember',difficulty:q.difficulty||'medium'
+    }));
+    const flashcards=(l.flashcards||[]).map(f=>({
+      front:f.front||'',back:f.back||'',realWorld:f.real_world||f.real_world_connection||''
+    }));
+    const examples=(l.examples||[]).map((ex,ei)=>({
+      order:ex.order||ei+1,problem:ex.problem||'',
+      steps:Array.isArray(ex.steps)?ex.steps:(ex.steps||'').split('|').map(s=>s.trim()).filter(Boolean),
+      answer:ex.answer||''
+    }));
+    const funFacts=Array.isArray(l.fun_facts)?l.fun_facts:
+      (l.fun_facts||'').split('|').map(s=>s.trim()).filter(Boolean);
+    return {
+      uid,fileId,subject,topic,
+      id:l.id||('lesson_'+(i+1)),
+      order:l.order||i+1,
+      title:l.title||('Lesson '+(i+1)),
+      body:body1,body1,body2,body3,sections,
+      funFact:funFacts[0]||'',funFacts,
+      keyConcepts:Array.isArray(l.key_concepts)?l.key_concepts:
+        (l.key_concepts||'').split('|').map(s=>s.trim()).filter(Boolean),
+      readTime:l.read_time_mins||7,rtl:!!l.rtl,imageUrl:l.image_url||'',
+      questions,flashcards,examples
+    };
+  });
+
+  showUploadStatus('Saving…');
+  const fileRecord={
+    id:fileId,filename:file.name,subject,topic,enabled:true,
+    uploadedAt:new Date().toISOString(),fileVersion:data.version||'1.0',
+    lessonCount:newLessons.length,
+    questionCount:newLessons.reduce((s,l)=>s+l.questions.length,0),
+    flashcardCount:newLessons.reduce((s,l)=>s+l.flashcards.length,0),
+    exampleCount:newLessons.reduce((s,l)=>s+l.examples.length,0)
+  };
+  await dbPut('files',fileRecord);
+  for(const l of newLessons) await dbPut('lessons',l);
+  if(!SUBJECTS.find(s=>s.name===subject)){
+    const newSubj={id:'subj_'+Date.now()+'_'+Math.random().toString(36).slice(2,5),name:subject,icon:subjConf(subject).ic,createdAt:new Date().toISOString()};
+    await dbPut('subjects',newSubj);
+  }
+  showToast('✅ '+newLessons.length+' lessons added — '+subject);
+  showUploadStatus('✓ '+file.name+' — '+newLessons.length+' lessons · '+fileRecord.questionCount+' Q · '+fileRecord.flashcardCount+' cards','ok');
+}
+
+/* ── Excel fallback processor ── */
+async function processExcelFile(file, fileId, forceSubject){
+  if(typeof XLSX==='undefined') throw new Error('Excel not supported — use JSON format instead');
+  showUploadStatus('Reading Excel…');
+  const buf=await file.arrayBuffer();
+  let wb;
+  try{ wb=XLSX.read(buf,{type:'array'}); } catch(e){ throw new Error('Cannot read Excel — '+e.message); }
+  if(!wb.SheetNames.length) throw new Error('File has no sheets');
+  const ciSheet =wb.Sheets['Course Info']||wb.Sheets['course_info']||null;
+  const lesSheet=wb.Sheets['Lessons']||wb.Sheets['lessons']
+    ||wb.Sheets[wb.SheetNames.find(n=>!/questions|flashcards|examples|course.?info/i.test(n))]
+    ||wb.Sheets[wb.SheetNames[0]];
+  const qSheet =wb.Sheets['Questions']||wb.Sheets['questions']||null;
+  const fcSheet=wb.Sheets['Flashcards']||wb.Sheets['flashcards']||null;
+  const exSheet=wb.Sheets['Examples']||wb.Sheets['examples']||null;
+  if(!lesSheet) throw new Error('No "Lessons" sheet found');
+  const lesRows=XLSX.utils.sheet_to_json(lesSheet,{defval:''});
+  const qRows  =qSheet ?XLSX.utils.sheet_to_json(qSheet, {defval:''}):[];
+  const fcRows =fcSheet?XLSX.utils.sheet_to_json(fcSheet,{defval:''}):[];
+  const exRows =exSheet?XLSX.utils.sheet_to_json(exSheet,{defval:''}):[];
+  const validLes=lesRows.filter(r=>r.lesson_id&&String(r.lesson_id).trim()!=='');
+  if(!validLes.length) throw new Error('No rows with "lesson_id" in Lessons sheet');
+  let courseInfo={};
+  if(ciSheet){
+    const ciRows=XLSX.utils.sheet_to_json(ciSheet,{header:['field','value'],defval:''});
+    ciRows.forEach(r=>{ if(r.field) courseInfo[String(r.field).toLowerCase().replace(/[\s\-]+/g,'_')]=String(r.value||'').trim(); });
+  }
+  let subject=forceSubject||String(courseInfo.subject||'').trim();
+  if(!subject){
+    const firstId=String(validLes[0].lesson_id||'').toLowerCase();
+    const pfxMap={maths:'Mathematics',math:'Mathematics',eng:'English',sci:'Science',urdu:'Urdu',phy:'Physics',chem:'Chemistry',bio:'Biology',hist:'History',geo:'Geography'};
+    const matched=Object.keys(pfxMap).find(k=>firstId.startsWith(k+'-')||firstId.startsWith(k+'_')||firstId===k);
+    subject=matched?pfxMap[matched]:'General';
+  }
+  let topic=String(courseInfo.course_title||'').trim();
+  if(!topic) topic=file.name.replace(/\.(xlsx|xls)$/i,'').replace(/[-_]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).trim();
+  showUploadStatus('Parsing '+validLes.length+' lessons…');
+  const newLessons=validLes.map((r,i)=>{
+    const uid=fileId+'_'+String(r.lesson_id).replace(/\s+/g,'_');
+    const funFacts=String(r.fun_facts||r.fun_fact||'').split('|').map(s=>s.trim()).filter(Boolean);
+    const body1=String(r.body_1||r.body||'');
+    return {uid,fileId,subject,topic,id:String(r.lesson_id).trim(),order:parseInt(r.lesson_order)||i+1,
+      title:String(r.title||'Lesson '+(i+1)),funFact:funFacts[0]||'',funFacts,imageUrl:String(r.image_url||''),
+      body:body1,body1,body2:String(r.body_2||''),body3:String(r.body_3||''),
+      keyConcepts:String(r.key_concepts||'').split('|').map(s=>s.trim()).filter(Boolean),
+      readTime:parseInt(r.read_time_mins)||7,rtl:String(r.rtl||'').toUpperCase()==='TRUE',
+      questions:[],flashcards:[],examples:[]};
+  });
+  let unmatchedQ=0,unmatchedFC=0;
+  qRows.filter(r=>r.lesson_id).forEach(q=>{
+    const l=newLessons.find(x=>x.id===String(q.lesson_id).trim());
+    if(l) l.questions.push({q:String(q.question||''),opts:{A:String(q.option_a||''),B:String(q.option_b||''),C:String(q.option_c||''),D:String(q.option_d||'')},correct:String(q.correct||'A').toUpperCase().trim(),explanation:String(q.explanation||''),hint:String(q.hint||''),bloom:String(q.bloom||'remember'),difficulty:String(q.difficulty||'medium')});
+    else unmatchedQ++;
+  });
+  fcRows.filter(r=>r.lesson_id).forEach(f=>{
+    const l=newLessons.find(x=>x.id===String(f.lesson_id).trim());
+    if(l) l.flashcards.push({front:String(f.front||''),back:String(f.back||''),realWorld:String(f.real_world_connection||'')});
+    else unmatchedFC++;
+  });
+  exRows.filter(r=>r.lesson_id).forEach(ex=>{
+    const l=newLessons.find(x=>x.id===String(ex.lesson_id).trim());
+    if(l) l.examples.push({order:parseInt(ex.example_order)||l.examples.length+1,problem:String(ex.problem||''),steps:String(ex.steps||'').split('|').map(s=>s.trim()).filter(Boolean),answer:String(ex.answer||'')});
+  });
+  newLessons.forEach(l=>{ if(l.examples.length>1) l.examples.sort((a,b)=>a.order-b.order); });
+  const warnings=[];
+  if(unmatchedQ) warnings.push(unmatchedQ+' question(s) had unmatched lesson_id');
+  if(!qSheet) warnings.push('No Questions sheet found');
+  if(!fcSheet) warnings.push('No Flashcards sheet found');
+  showUploadStatus('Saving…');
+  const fileRecord={id:fileId,filename:file.name,subject,topic,enabled:true,
+    uploadedAt:new Date().toISOString(),lessonCount:newLessons.length,
+    questionCount:newLessons.reduce((s,l)=>s+l.questions.length,0),
+    flashcardCount:newLessons.reduce((s,l)=>s+l.flashcards.length,0),
+    exampleCount:newLessons.reduce((s,l)=>s+l.examples.length,0),
+    warnings:warnings.length?warnings:undefined};
+  await dbPut('files',fileRecord);
+  for(const l of newLessons) await dbPut('lessons',l);
+  if(!SUBJECTS.find(s=>s.name===subject)){
+    const newSubj={id:'subj_'+Date.now()+'_'+Math.random().toString(36).slice(2,5),name:subject,icon:subjConf(subject).ic,createdAt:new Date().toISOString()};
+    await dbPut('subjects',newSubj);
+  }
+  showToast('✅ '+newLessons.length+' lessons — '+subject+(warnings.length?' (⚠ '+warnings[0]+')':''));
+  showUploadStatus('✓ '+file.name+' — '+newLessons.length+' lessons'+(warnings.length?' · ⚠ '+warnings[0]:''),'ok');
 }
 
 /* ── Quiz Pack processor ── */
@@ -6156,6 +6188,22 @@ function renderBuilderBody(){
     html += `</div></div>`;
   }
 
+  // Name — always visible
+  html += `<div class="builder-section">
+    <div class="builder-section-title">Name</div>
+    <div style="padding:0 0 4px;">
+      <input type="text" id="test-name-input"
+        placeholder="${TB.type='exam'?'e.g. Science Mid-term Exam':'e.g. Cells Revision Quiz'}"
+        value="${esc(TB.configName)}"
+        oninput="TB.configName=this.value"
+        maxlength="60" autocomplete="off"
+        style="width:100%;background:var(--bg3);border:1.5px solid var(--rim2);border-radius:var(--r3);padding:10px 12px;color:var(--snow);font-size:.9rem;font-family:var(--font);font-weight:700;transition:border-color .2s;"
+        onfocus="this.style.borderColor='var(--vil)'"
+        onblur="this.style.borderColor='var(--rim2)'">
+      <div style="font-size:.68rem;color:var(--fog);margin-top:4px;">Give your ${TB.type==='exam'?'exam':'quiz'} a clear name — shown on results and progress screens</div>
+    </div>
+  </div>`;
+
   // Assign to student toggle (always show)
   html += `<div class="builder-section">
     <div class="builder-section-title">Assign</div>
@@ -6166,10 +6214,6 @@ function renderBuilderBody(){
       </div>
       <div class="toggle ${TB.assignToStudent?'on':''}" onclick="TB.assignToStudent=!TB.assignToStudent;renderBuilderBody();"></div>
     </div>
-    ${TB.assignToStudent?`<div class="input-wrap" style="margin-top:8px;">
-      <span class="input-icon">📝</span>
-      <input type="text" id="test-name-input" placeholder="Test name e.g. HCF Revision Quiz" value="${esc(TB.configName)}" oninput="TB.configName=this.value" maxlength="40" autocomplete="off">
-    </div>`:''}
   </div>`;
 
   // Action buttons
@@ -6185,6 +6229,9 @@ function renderBuilderBody(){
 
   html += `</div>`;
   body.innerHTML = html;
+  // Restore name field — survives toggle-driven re-renders
+  const nameInp = document.getElementById('test-name-input');
+  if(nameInp && TB.configName) nameInp.value = TB.configName;
 }
 
 /* ── Builder helpers ── */
@@ -6320,7 +6367,7 @@ function getScopeLabel(){
 
 /* ── Start / Save ── */
 async function saveTestConfig(){
-  const name = TB.configName || TB.type==='exam'?'Exam':'Quiz' + ' — ' + getScopeLabel();
+  const name = (TB.configName||'').trim() || (TB.type==='exam'?'Exam':'Quiz') + ' — ' + getScopeLabel();
   const id = 'cfg_'+Date.now();
   const cfg = {
     id, name, type:TB.type, scope:serializeScope(),
@@ -6365,7 +6412,7 @@ function startTest(){
   if(!questions.length){ showToast('No questions match your selection'); return; }
   TR = {
     type: TB.type,
-    name: TB.configName || (TB.type==='exam'?'Exam':'Quiz') + ' — ' + getScopeLabel(),
+    name: (TB.configName||'').trim() || (TB.type==='exam'?'Exam':'Quiz') + ' — ' + getScopeLabel(),
     scopeLabel: getScopeLabel(),
     questions, idx:0, answers:[],
     startTime: Date.now(),
